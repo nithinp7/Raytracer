@@ -1,0 +1,512 @@
+#version 430 core
+
+#define PI 3.1415926538
+
+#define MAX_TEXTURES 3
+#define MAX_MATERIALS 5
+
+#define MAX_SCENE_BOUNDS 1000.0
+
+#define MAX_TRIS 20
+#define MAX_SPHERES 50
+#define MAX_PLANES 1
+
+#define MAX_LIGHTS 4
+
+#define RAY_STEPS 5000
+#define RAY_MAX_DIST 1000.0f
+#define RAY_EPSILON 0.01f
+#define GRAD_EPSILON 0.01f
+
+#define INVALID_TYPE -1
+#define TRI_TYPE 0
+#define SPHERE_TYPE 1
+#define PLANE_TYPE 2
+
+//NOTE ALL UBO-RELATED STRUCTS USE VEC4 IN PLACE OF VEC3
+
+struct material {
+    vec4 difCol;
+    vec4 specCol;
+    vec4 reflCol;
+    vec4 transpCol;
+
+    float shininess;
+    float refrIndx;
+    
+    int texIndx;
+};
+
+struct sphere {
+    vec4 center;
+    float radius;
+    int matIndx;
+};
+
+struct tri {
+    vec4 a;
+    vec4 ab;
+    vec4 ac;
+    vec4 n;
+
+    //texture info
+    vec2 tex0;
+    vec2 tex1;
+    vec2 tex2;
+
+    int matIndx;
+};
+
+struct plane {
+    vec4 p;
+    vec4 n;
+    vec4 u;
+    vec4 v;
+
+    int matIndx;
+};
+
+//per-intersection information (as opposed to per-object info that can be inferred later)
+struct intersInfo {
+    float dist;
+    vec3 p;
+    //reminder: n cannot necessarily be inferred from the object later
+    vec3 n;
+    vec2 txt;
+};
+
+struct closestInfo {
+    float dist;
+    //triangle, sphere, etc.
+    int objType;
+    //index within array of respective type
+    int indx;
+    intersInfo inters;
+};
+
+layout(binding = 0, rgba32f) uniform image2D framebuffer;
+
+uniform sampler2D texs [MAX_TEXTURES];
+
+layout(std140) uniform Unifs {
+    tri tris [MAX_TRIS];
+    sphere spheres [MAX_SPHERES];
+    plane planes [MAX_PLANES];
+
+    vec4 lights [MAX_LIGHTS];
+
+    material maters [MAX_MATERIALS];
+
+    vec4 ambLight;
+    vec4 bgCol;
+
+    vec4 eye;
+    vec4 ray00;
+    vec4 ray01;
+    vec4 ray10;
+    vec4 ray11;
+
+    int num_tris;
+    int num_spheres;
+    int num_planes;
+    int num_lights;
+
+    float time;
+
+    //float _pad[3];
+};
+
+
+//**************RAY TRACING***************
+bool intersectTri(tri t, vec3 origin, vec3 dir, inout intersInfo inters) {
+
+    vec3 n = t.n.xyz;
+
+    float n_dir = dot(n, dir);
+    
+    //don't worry about side-on intersections (explicitly check to avoid divide by zero later)
+    if(abs(n_dir) < RAY_EPSILON)
+        return false;
+    
+	vec3 bc = inverse(mat3(t.ab.xyz, t.ac.xyz, -dir)) * (origin - t.a.xyz);
+
+    if((bc.z >= 0.0) && (0.0 <= bc.x) && (bc.x <= 1.0) && (0.0 <= bc.y) && (bc.y <= 1.0) && (bc.x + bc.y <= 1.0)) {
+        inters.dist = bc.z;
+        inters.p = origin + bc.z*dir;
+        inters.n = n;//n_dir < 0 ? n : -n;
+        inters.txt = (1.0 - bc.x - bc.y) * t.tex0 + bc.x * t.tex1 + bc.y * t.tex2;
+        return true;
+    }
+    return false;
+}
+
+bool intersectTris(vec3 origin, vec3 dir, inout closestInfo closest) {
+    bool found = false;
+    for (int i = 0; i < num_tris; i++) {
+        intersInfo inters;
+        if(intersectTri(tris[i], origin, dir, inters) && inters.dist < closest.dist) {
+            closest.inters = inters;
+            closest.dist = inters.dist;
+            closest.objType = TRI_TYPE;
+            closest.indx = i;
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool intersectSphere(sphere s, vec3 origin, vec3 dir, inout intersInfo inters) {
+    vec3 dif = origin - s.center.xyz;
+    float a = dot(dir, dir);
+    float b = 2.0 * dot(dif, dir);
+    float c = dot(dif, dif) - s.radius * s.radius;
+    float d = b * b - 4.0 * a * c;
+    
+    if(d >= 0.0)
+    {
+        d = sqrt(d);
+        float t0 = 0.5 * (-b - d) / a;
+        float t1 = 0.5 * (-b + d) / a;
+        
+        if(t0 >= 0.0) 
+            inters.dist = t0;
+        else if(t1 >= 0.0)
+            inters.dist = t1;
+        else
+            return false;
+            
+        inters.p = origin + inters.dist*dir;
+        inters.n = normalize(inters.p - s.center.xyz);
+
+        if(length(dif) < s.radius)
+            inters.n = -inters.n;
+
+        //now calculate texture coordinate
+        float phi = acos(inters.n.z);
+        vec3 proj = normalize(vec3(inters.n.xy, 0.0));
+        float theta = acos(proj.x);
+
+        if(proj.y < 0)
+            theta = 2.0 * PI - theta;
+
+        inters.txt = vec2(theta / (2.0 * PI), phi / PI);
+
+        return true;
+    }
+    
+    return false;
+}
+
+bool intersectSpheres(vec3 origin, vec3 dir, inout closestInfo closest) {
+    bool found = false;
+    for (int i = 0; i < num_spheres; i++) {
+        intersInfo inters;
+        if(intersectSphere(spheres[i], origin, dir, inters) && inters.dist < closest.dist) {
+            closest.inters = inters;
+            closest.dist = inters.dist;
+            closest.objType = SPHERE_TYPE;
+            closest.indx = i;
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool intersectPlane(plane p, vec3 origin, vec3 dir, inout intersInfo inters) {
+    vec3 point = p.p.xyz;
+    vec3 n = p.n.xyz;
+
+    vec3 dif = origin - point;
+    float perp = dot(dif, n);
+    float dirn = dot(dir, n);
+
+    if(perp * dirn < 0) {
+        inters.dist = -perp / dirn;
+        inters.p = origin + inters.dist*dir;
+        inters.n = n;
+        //can use dif instead of inters.p - point
+        inters.txt = fract(dif.xz/100.0);
+        return true;
+    }
+    return false;
+}
+
+bool intersectPlanes(vec3 origin, vec3 dir, inout closestInfo closest) {
+    bool found = false;
+    for (int i = 0; i < num_planes; i++) {
+        intersInfo inters;
+        if(intersectPlane(planes[i], origin, dir, inters) && inters.dist < closest.dist) {
+            closest.inters = inters;
+            closest.dist = inters.dist;
+            closest.objType = PLANE_TYPE;
+            closest.indx = i;
+            found = true;
+        }
+    }
+    return found;
+}
+
+void getClosest(vec3 origin, vec3 dir, inout closestInfo closest) {
+    closest.dist = MAX_SCENE_BOUNDS;
+    closest.indx = -1;
+    intersectTris(origin, dir, closest);
+    intersectSpheres(origin, dir, closest);
+    intersectPlanes(origin, dir, closest);
+}
+
+vec4 getCol(vec3 dir, closestInfo closest) {
+    int mindx = -1;
+    switch(closest.objType) {
+        
+        case TRI_TYPE:
+            mindx = tris[closest.indx].matIndx;
+        break;
+        
+        case SPHERE_TYPE:
+            mindx = spheres[closest.indx].matIndx;
+        break;
+        
+        case PLANE_TYPE:
+            mindx = planes[closest.indx].matIndx;
+        break;
+        
+        default:
+            return vec4(0, 0, 0, 1);
+        break;
+    }
+    material m = maters[mindx];
+
+    vec4 texCol = (m.texIndx==-1) ? vec4(1, 1, 1, 1) : texture(texs[m.texIndx], closest.inters.txt);
+    vec4 res = m.difCol*ambLight;
+    
+    vec3 n = dot(closest.inters.n, dir) < 0 ? closest.inters.n : -closest.inters.n;
+    vec3 p = closest.inters.p + RAY_EPSILON*closest.inters.n;
+
+    for(int i=0; i < num_lights; i++) {
+        vec3 lpos = lights[i].xyz;
+        vec3 ldir = lpos - p;
+        float r = length(ldir);
+        ldir = normalize(ldir);
+
+        //NOTE: questionable if shadows are working
+        closestInfo shadow;
+        getClosest(p, ldir, shadow);
+        if(shadow.indx==-1 || shadow.dist > r) {
+            res += m.difCol*max(0.0, dot(ldir, n)) / (0.01*r*r);
+            res += m.specCol*pow(dot(normalize(ldir - dir), n), m.shininess) / (0.01*r*r);
+        } 
+    }
+
+    return texCol*res;
+}
+
+//raytrace version
+vec4 trace2(vec3 origin, vec3 dir, int depth) {
+    closestInfo closest;
+    getClosest(origin, dir, closest);
+    if (closest.indx != -1) {
+        //vec4 gray = vec4(max(0.0, 1.0 - pow(closest.dist, 2)/ 400.0));
+        return getCol(dir, closest);// *gray;
+    }
+    return bgCol;
+}
+
+vec4 trace(vec3 origin, vec3 dir, int depth) {
+    vec4 mulAcc = vec4(1, 1, 1, 1);
+    vec4 sum = vec4(0, 0, 0, 0);
+
+    for(int i=0; i<depth; i++) {
+        closestInfo closest;
+        getClosest(origin, dir, closest);
+        if (closest.indx != -1) {
+            int mindx = -1;
+            switch(closest.objType) {
+                case TRI_TYPE:
+                    mindx = tris[closest.indx].matIndx;
+                break;
+        
+                case SPHERE_TYPE:
+                    mindx = spheres[closest.indx].matIndx;
+                break;
+        
+                case PLANE_TYPE:
+                    mindx = planes[closest.indx].matIndx;
+                break;
+        
+                default:
+                    return vec4(0, 0, 0, 1);
+                break;
+            }
+            material m = maters[mindx];
+
+            vec4 texCol = (m.texIndx==-1) ? vec4(1, 1, 1, 1) : texture(texs[m.texIndx], closest.inters.txt);
+            mulAcc *= texCol;
+
+            vec4 res = m.difCol*ambLight;
+    
+            vec3 n = dot(closest.inters.n, dir) < 0 ? closest.inters.n : -closest.inters.n;
+            vec3 p = closest.inters.p + RAY_EPSILON*closest.inters.n;
+
+            for(int i=0; i < num_lights; i++) {
+                vec3 lpos = lights[i].xyz;
+                vec3 ldir = lpos - p;
+                float r = length(ldir);
+                ldir = normalize(ldir);
+
+                closestInfo shadow;
+                getClosest(p, ldir, shadow);
+                if(shadow.indx==-1 || shadow.dist > r) {
+                    res += m.difCol*max(0.0, dot(ldir, n)) / (0.002*r + 0.005*r*r);
+                    res += m.specCol*pow(dot(normalize(ldir - dir), n), m.shininess) / (0.005*r + 0.005*r*r);
+                } 
+            }
+
+            origin = p;
+            dir = normalize(dir - 2*dot(dir, n)*n);
+            sum += mulAcc*res;
+            mulAcc *= m.reflCol;
+        } else {
+            return sum + mulAcc*bgCol;
+        }
+    }
+    return sum;
+}
+
+
+
+
+// *****TODO!! REFACTOR RAY MARCH!! ****
+
+
+
+
+
+
+//**************RAY MARCHING***************
+/*
+const vec3 circ = vec3(0.0, 0.0, 15.0);
+float sdf(vec3 v) {
+    //return length(v - circ) - 4.0;
+    //return length(vec3(mod(v.x, 2.0)-1.0, mod(v.y, 2.0)-1.0, mod(v.z, 2.0)-1.0)) - 0.3;
+    return min(
+        length(vec3(mod(v.x, 2.0)-1.0, v.y+1.0, mod(v.z, 2.0)-1.0)) - 0.3,
+        v.y + 2.1 //+ 2.0*sin(1.1*time)
+    );
+}
+
+float sdf2(vec3 v) {
+    //return length(v - circ) - 2 + 0.1*sin(v.x)*cos(v.y+51.0)*cos(31.0+v.y);
+    return length(v - circ) - 5 + (2*sin(0.05*time) + 1)*0.5*sin(v.x+time)*cos(v.y+time+51.0)*cos(time+31.0+v.y);
+    //return length(vec3(mod(v.x, 10.0)-5.0, mod(v.y, 10.0)-5.0, mod(v.z, 10.0)-5.0)) - 2 + (2*sin(0.05*time) + 1)*0.5*sin(v.x+time)*cos(v.y+time+51.0)*cos(time+31.0+v.y);
+}
+
+float sdsdff(vec3 z)
+{
+    float Scale = 10;
+    vec3 Offset = vec3(0, 0, 30);
+    float r;
+    int n = 0;
+    while (n < 4) {
+       if(z.x+z.y<0) z.xy = -z.yx; // fold 1
+       if(z.x+z.z<0) z.xz = -z.zx; // fold 2
+       if(z.y+z.z<0) z.zy = -z.yz; // fold 3	
+       z = z*Scale - Offset*(Scale-1.0);
+       n++;
+    }
+    return (length(z) ) * pow(Scale, -float(n));
+}
+
+vec3 calcNormal(vec3 v) {
+    return normalize(vec3(
+            sdf(vec3(v.x + GRAD_EPSILON, v.yz)) - sdf(vec3(v.x - GRAD_EPSILON, v.yz)),
+            sdf(vec3(v.x, v.y + GRAD_EPSILON, v.z)) - sdf(vec3(v.x, v.y - GRAD_EPSILON, v.z)),
+            sdf(vec3(v.xy, v.z + GRAD_EPSILON)) - sdf(vec3(v.xy, v.z - GRAD_EPSILON))
+        ));
+}
+
+//const vec3 light = vec3(5*cos(time), 3, 5 + 5*sin(time)); //vec3(2.0, 2.0, -1.0) + 
+//const vec3 ambLight = vec3(0.2, 0.2, 0.2);
+
+//should be a material property
+//const vec3 specCol = vec3(0.5, 0.5, 0.5);
+//const float specPow = 40.0;
+
+//determines if the given path to the light source is blocked or not
+bool lightVisible(vec3 v, vec3 dir, float r, vec3 n) {
+    if(dot(dir, n) < 0)
+        return false;
+    float dist_traveled = 0.0;
+    vec3 pos = v;
+    float sd;
+    for(int i=0; i<RAY_STEPS; i++) {
+        sd = sdf(pos);
+        if(r-dist_traveled < RAY_EPSILON || dist_traveled > RAY_MAX_DIST)
+            return true;
+        if(abs(sd) < RAY_EPSILON) 
+            return false;
+        dist_traveled += sd;
+        pos += sd*dir;
+    }
+    return true;
+}
+
+vec4 calcColor(vec3 v, vec3 dir, vec3 difCol, int raySteps) {
+    vec3 n = calcNormal(v);
+    vec3 l = light - v;
+    vec3 lnorm = normalize(l);
+    float r = length(l);
+
+    //ambient light
+    vec3 col = ambLight*difCol;
+    
+    //if the light source is visible
+    if(lightVisible(v + 5*RAY_EPSILON*lnorm, lnorm, r, n)) {
+        //directional light
+        col += dot(lnorm, n)*difCol / (0.01*r*r);
+        //specular light
+        col += pow(dot(normalize(lnorm - dir), n), specPow)*specCol / (0.01*r*r);
+    }
+    return vec4(col, 1);
+}
+
+vec4 trace2(vec3 origin, vec3 dir) {
+    float dist_traveled = 0.0;
+    vec3 pos = origin;
+    float sd;
+    for(int i=0; i<RAY_STEPS; i++) {
+        sd = sdf(pos);
+        if(abs(sd) < RAY_EPSILON) 
+            return calcColor(pos, dir, vec3(0.2, 0.2, 0.8), i);
+        if(dist_traveled > RAY_MAX_DIST)
+            break;
+        dist_traveled += sd;
+        pos += sd*dir;
+    }
+    //if nothing was hit, return background color
+    return vec4(0, 0, 0, 1);//(0.4, 0.4, 0.5, 1);
+}
+
+*/
+
+
+
+
+
+//uniform testTex sampler2D;
+
+
+
+//**************MAIN***************
+layout (local_size_x = 1, local_size_y = 1) in;
+void main(void) {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(framebuffer);
+  if (pix.x >= size.x || pix.y >= size.y) {
+    return;
+  }
+  vec2 pos = vec2(pix) / vec2(size.x - 1, size.y - 1);
+  vec3 dir = mix(mix(ray00, ray01, pos.y), mix(ray10, ray11, pos.y), pos.x).xyz;
+  vec4 color = trace(eye.xyz, dir, 2);
+  //vec4 color = vec4(normalize(eye.xyz), 1);
+  imageStore(framebuffer, pix, color);
+}
