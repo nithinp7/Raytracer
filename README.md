@@ -3,7 +3,7 @@ GPU implementation of a generalized raytracer with support for arbitrary meshes 
 
 YouTube Video Link: https://www.youtube.com/watch?v=uv8pp8teYh4
 
-![Image of Raytracer 1](https://github.com/nithinp7/Raytracer/blob/master/PathTracer%2010_1_2020%202_45_14%20PM.png)
+![Image of Raytracer 1](https://github.com/nithinp7/Raytracer/blob/master/RaytracerGPU%202020-09-24%2013-05-58_Moment.jpg)
 
 ![Image of Raytracer 2](https://github.com/nithinp7/Raytracer/blob/master/RaytracerGPU%209_20_2020%204_38_51%20PM.png)
 
